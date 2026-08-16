@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { JobStore } from './job-store.js';
 import { createServer } from './server.js';
 import type { SpotdlConfig } from './resolve.js';
@@ -19,7 +20,10 @@ const config = (): SpotdlConfig => ({
 const stagingBase = process.env.SPOTDL_ADDON_DOWNLOADS_DIR ?? '/data/downloads';
 const port = Number(process.env.SPOTDL_ADDON_PORT ?? '8587');
 
-const jobs = new JobStore(stagingBase, config);
+// Persist the job ledger under the addon's data volume so a restart reports
+// in-flight downloads as failed rather than forgetting them (issue #515).
+const dataDir = process.env.SPOTDL_ADDON_DATA_DIR ?? '/data';
+const jobs = new JobStore(stagingBase, config, {}, join(dataDir, 'jobs.db'));
 const app = createServer({ token, jobs });
 
 console.log(`spotDL addon listening on :${port}`);
