@@ -26,6 +26,8 @@ export interface SpotdlConfig {
    *  built-in shared client. Forwarded as SPOTIPY_CLIENT_ID/SECRET on spawn. */
   clientId?: string;
   clientSecret?: string;
+  /** spotDL's own download thread pool. See DEFAULT_THREADS. */
+  threads?: number;
 }
 
 export interface ResolveDeps {
@@ -82,6 +84,25 @@ export interface RunningResolve {
  * with one `<url> - <Exception>: <reason>` line per song it could not get —
  * off by default, and without it a failed track leaves no trace at all.
  */
+/**
+ * spotDL's default thread pool is 4, and the addon used to run every job the
+ * moment it arrived — so two playlists meant ~8 concurrent YouTube fetches from
+ * one IP. YouTube rate-limited the deployment down to ~9 % success (issue #601:
+ * 134 downloads against 793 search misses + 485 yt-dlp errors over 12 h), which
+ * looks exactly like "the song isn't on YouTube" and isn't. Jobs are serialized
+ * in `JobStore` and each one's fan-out is capped here; the two together are the
+ * fix, since serializing alone still leaves 4 in flight.
+ */
+export const DEFAULT_THREADS = 2;
+/** Above this, a value is a typo rather than an intent — clamp, don't obey. */
+export const MAX_THREADS = 8;
+
+/** Clamp to a sane pool size; a missing/garbage value falls back to the default. */
+export function resolveThreads(threads: number | undefined): number {
+  if (threads === undefined || !Number.isFinite(threads)) return DEFAULT_THREADS;
+  return Math.min(MAX_THREADS, Math.max(1, Math.trunc(threads)));
+}
+
 export function buildArgs(
   url: string,
   stagingDir: string,
@@ -100,6 +121,8 @@ export function buildArgs(
     "--log-level",
     "INFO",
     "--print-errors",
+    "--threads",
+    String(resolveThreads(cfg.threads)),
   ];
   if (cfg.cookiesFile && existsSync(cfg.cookiesFile))
     args.push("--cookie-file", cfg.cookiesFile);

@@ -6,6 +6,8 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import {
   buildArgs,
+  DEFAULT_THREADS,
+  MAX_THREADS,
   spotifyEnv,
   runSpotdl,
   PLAIN_OUTPUT_ENV,
@@ -22,6 +24,8 @@ export function fakeSpawn(
     writeTo?: () => void;
     code?: number;
     hang?: boolean;
+    /** Hold the process open until this resolves (tests observing mid-run state). */
+    gate?: Promise<unknown>;
   } = {},
   capture?: { opts?: unknown; killed?: string },
 ) {
@@ -53,7 +57,9 @@ export function fakeSpawn(
     queueMicrotask(() => {
       for (const l of opts.lines ?? []) em.stdout.write(l + "\n");
       opts.writeTo?.();
-      if (!opts.hang) setTimeout(() => finish(opts.code ?? 0), 5);
+      if (opts.hang) return;
+      if (opts.gate) void opts.gate.then(() => finish(opts.code ?? 0));
+      else setTimeout(() => finish(opts.code ?? 0), 5);
     });
     return em;
   }) as unknown as typeof import("node:child_process").spawn;
@@ -73,6 +79,33 @@ describe("buildArgs", () => {
     expect(args).toContain("--simple-tui");
     expect(args.join(" ")).toContain("--log-level INFO");
     expect(args).toContain("--print-errors");
+  });
+
+  it("caps spotDL's own thread pool, defaulting conservatively (issue #601)", () => {
+    const def = buildArgs("https://open.spotify.com/album/x", "/stage", {
+      binaryPath: "spotdl",
+    });
+    // Unbounded, spotDL fans out 4 concurrent YouTube fetches per job; stacked
+    // across jobs that is what got the deployment rate-limited to ~9% success.
+    expect(def.join(" ")).toContain(`--threads ${DEFAULT_THREADS}`);
+
+    const explicit = buildArgs("https://open.spotify.com/album/x", "/stage", {
+      binaryPath: "spotdl",
+      threads: 1,
+    });
+    expect(explicit.join(" ")).toContain("--threads 1");
+  });
+
+  it("refuses a nonsensical thread count rather than passing it through", () => {
+    for (const threads of [0, -3, 99]) {
+      const args = buildArgs("https://x", "/stage", {
+        binaryPath: "spotdl",
+        threads,
+      });
+      const n = Number(args[args.indexOf("--threads") + 1]);
+      expect(n).toBeGreaterThanOrEqual(1);
+      expect(n).toBeLessThanOrEqual(MAX_THREADS);
+    }
   });
 });
 

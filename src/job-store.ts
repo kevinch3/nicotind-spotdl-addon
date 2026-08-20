@@ -96,6 +96,9 @@ export function matchFilesToItems(
 export class JobStore {
   private jobs = new Map<string, JobEntry>();
   private running = new Map<string, RunningResolve>();
+  /** Pending runs, oldest first. Drained one at a time — see `enqueue`. */
+  private queue: Array<() => Promise<void>> = [];
+  private draining = false;
   private db: Database;
 
   constructor(
@@ -188,12 +191,51 @@ export class JobStore {
     const entry: JobEntry = { job, paths: new Map() };
     this.jobs.set(id, entry);
     this.persist(entry); // durable as `active` before the background run starts
-    void this.run(id, url, entry);
+    this.enqueue(() => this.run(id, url, entry));
     return job;
+  }
+
+  /**
+   * Run one spotDL at a time (NicotinD #601). Every `create` used to spawn
+   * immediately, so importing three playlists meant three concurrent spotDLs —
+   * each with its own thread pool — hammering YouTube from one IP until it
+   * rate-limited us to ~9 % success. A playlist import is not latency-sensitive,
+   * and a queued job is still `active` and visible to core's poll from the
+   * moment it is created, so the wait costs the user nothing but a later start.
+   */
+  private enqueue(task: () => Promise<void>): void {
+    this.queue.push(task);
+    void this.drain();
+  }
+
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      let next: (() => Promise<void>) | undefined;
+      while ((next = this.queue.shift())) {
+        // `run` handles its own failures; guard anyway so one thrown task can
+        // never strand every job behind it.
+        try {
+          await next();
+        } catch {
+          /* already recorded on the job */
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
   }
 
   private async run(id: string, url: string, entry: JobEntry): Promise<void> {
     const { job } = entry;
+    // Serializing made "cancelled before it ever started" reachable: `cancel`
+    // has no process to signal while a job is still queued, so the queue itself
+    // must drop it rather than spawn spotDL for a job the user already closed.
+    // Narrow a copy, not `job.state` itself: `cancel()` mutates it during the
+    // await below, and narrowing the field would make that check look dead.
+    const startState: AddonJob["state"] = job.state;
+    if (startState !== "active") return;
     let expected = 0;
     let seq = 0;
     const touch = (): void => {
@@ -216,12 +258,21 @@ export class JobStore {
     const onTrack = (ev: DownloaderTrackEvent): void => {
       // spotDL reports each song once, when it is finished with it; a second
       // line for the same title (a retry) updates rather than duplicates.
-      const existing = job.items.find((i) => i.title === ev.title);
       const state: AddonJobItem["state"] =
         ev.status === "failed" ? "unavailable" : "completed";
+      const existing = job.items.find((i) => i.title === ev.title);
       if (existing) {
         existing.state = state;
         existing.updatedAt = Date.now();
+        touch();
+        return;
+      }
+      // Claim a placeholder rather than appending past the announced total.
+      const slot = job.items.find((i) => i.state === "queued");
+      if (slot) {
+        slot.title = ev.title;
+        slot.state = state;
+        slot.updatedAt = Date.now();
       } else {
         job.items.push(item(ev.title, state));
       }
@@ -241,6 +292,14 @@ export class JobStore {
           },
           onTotal: (total) => {
             expected = total;
+            // Announce the whole set at once (NicotinD #595). spotDL prints
+            // "Found N songs" up front but reports tracks one at a time, so the
+            // card used to walk 0-of-1 -> 2-of-14 -> 7-of-32 as the denominator
+            // caught up. `queued` placeholders make the denominator honest from
+            // the first poll; each is claimed as its track lands.
+            for (let n = job.items.length; n < total; n++)
+              job.items.push(item(null, "queued"));
+            touch();
           },
           onTrack,
           onOutput: (line) => this.log(`[spotdl ${id.slice(0, 8)}] ${line}`),
@@ -257,10 +316,12 @@ export class JobStore {
       );
       result.files.forEach((f, fi) => {
         let target = owner[fi]! >= 0 ? job.items[owner[fi]!]! : undefined;
+        if (!target) target = job.items.find((i) => i.state === "queued");
         if (!target) {
           target = item(basename(f.path, extname(f.path)), "completed");
           job.items.push(target);
         }
+        if (!target.title) target.title = basename(f.path, extname(f.path));
         target.state = "completed";
         target.fileReady = true;
         target.filename = f.filename;
@@ -272,6 +333,9 @@ export class JobStore {
       // deliverable — say so rather than hand the host an item it can't fetch.
       for (const i of job.items) {
         if (i.state === "completed" && !i.fileReady) i.state = "unavailable";
+        // A placeholder spotDL never reached is not deliverable either; the run
+        // is over, so nothing stays `queued`.
+        if (i.state === "queued") i.state = "unavailable";
       }
       // The announced total is the honest denominator: tracks spotDL never
       // mentioned (it died before reaching them) become unavailable placeholders.

@@ -53,10 +53,38 @@ Then in NicotinD → **Extensions → Add addon**, register `http://<host>:8587`
 | `SPOTDL_ADDON_CLIENT_SECRET` | —        | —                 | Spotify Client Secret (optional)                          |
 | `SPOTDL_ADDON_BINARY`        | —        | `spotdl`          | spotdl binary path                                        |
 | `SPOTDL_ADDON_COOKIES`       | —        | —                 | Netscape cookies.txt path (unblocks a flagged IP)         |
+| `SPOTDL_ADDON_THREADS`       | —        | `2`               | spotDL's per-job download fan-out (clamped to 1..8)       |
 | `SPOTDL_ADDON_DOWNLOADS_DIR` | —        | `/data/downloads` | staging dir                                               |
 | `SPOTDL_ADDON_PORT`          | —        | `8587`            | HTTP listen port                                          |
 
 Only `GET /addon/v1/manifest` + `/health` are unauthenticated; every other route needs the bearer token.
+
+## One job at a time, and a capped fan-out
+
+Jobs are **serialized**: `create` returns an `active` job immediately and queues the run, and only
+one `spotdl` process is ever alive. Each one's own thread pool is capped too (`--threads`, default
+**2**, `SPOTDL_ADDON_THREADS`).
+
+Both halves are needed, and neither is a micro-optimisation. The addon used to spawn every job the
+moment it arrived, and spotDL's default pool is 4 — so importing three playlists meant ~12 concurrent
+YouTube fetches from one IP. YouTube rate-limited the reference deployment down to **~9 % success**
+(NicotinD #601: over 12 h, 134 downloads against 793 "no usable results" + 485 yt-dlp errors + 173
+`JSONDecodeError`), and the failures name songs YouTube Music certainly has. The symptom reads like
+"the track isn't available" and is not: `yt-dlp` was current and a direct fetch of a *failing* URL
+succeeded. Serializing alone would still leave 4 in flight; capping alone would still stack N jobs.
+
+A playlist import is not latency-sensitive, so waiting costs the user nothing — a queued job is
+`active` and visible to core's poll from creation. Serializing does make one state reachable that
+never was before: a job **cancelled before it started**, which has no process to signal. The queue
+drops it rather than spawning spotDL for a download the user already closed.
+
+## The announced total is honest from the first poll
+
+spotDL prints `Found N songs` up front but reports tracks one at a time. The addon now pushes `N`
+**`queued` placeholders** the moment that total is announced, and each track claims one as it lands;
+anything still `queued` when the run ends becomes `unavailable`. Without this the card's denominator
+grew under the user — `0 of 1` → `2 of 14` → `7 of 32` — which reads as the download *changing its
+mind* about how big it is (NicotinD #595).
 
 ## Develop
 
