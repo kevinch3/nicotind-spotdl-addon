@@ -12,9 +12,17 @@ yt-dlp catch-all addon (`priority: -10`) still handles everything else.
 ## How it works
 
 `POST /addon/v1/jobs {intent:'url', url}` spawns `spotdl download`, downloading into the addon's
-storage. Items flip `fileReady` and the bytes are served from
-`GET /addon/v1/jobs/:id/files/:itemId` — core's `AddonJobPoller` fetches them and runs the same
-organize → scan pipeline every source uses. spotDL uses yt-dlp under the hood, so YouTube bot-checks
+storage, and **reads its output as it runs** (`--simple-tui --log-level INFO --print-errors`, parsed
+with `@nicotind/addon-sdk`'s `downloader-output` parsers): the list's name becomes the job's `title`,
+every `Downloaded` / `Skipping` / failed-song line becomes one item **in that order**, and when spotDL
+announced more songs than it ever reported (it died partway) the remainder are `unavailable`
+placeholders — so a 1-of-16 playlist reads "1 of 16", `partial`, with spotDL's own error lines, not a
+clean "Done 1 of 1" (NicotinD #585; the addon used to run with `stdio: 'ignore'` and glob staging).
+Every spotDL line is also written to the addon's log, so `docker logs` has the transcript. Landed
+files are paired to reported tracks by `<artist dir> - <stem>` ≙ `Artist - Title`. Items flip
+`fileReady` and the bytes are served from `GET /addon/v1/jobs/:id/files/:itemId` — core's
+`AddonJobPoller` fetches them and runs the same organize → scan pipeline every source uses.
+`POST /addon/v1/jobs/:id/cancel` SIGTERMs spotDL and closes the job `cancelled`. spotDL uses yt-dlp under the hood, so YouTube bot-checks
 are mitigated by the **bgutil PO-token provider** run as a **sidecar** (the image bakes the paired
 `bgutil-ytdlp-pot-provider` plugin; spotDL can't thread extractor-args, so the sidecar must be
 reachable at the plugin's default `127.0.0.1:4416` — share the network namespace).
@@ -33,15 +41,15 @@ Then in NicotinD → **Extensions → Add addon**, register `http://<host>:8587`
 
 ## Configuration
 
-| Env var | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `SPOTDL_ADDON_TOKEN` | **yes** | — | Bearer token core authenticates with |
-| `SPOTDL_ADDON_CLIENT_ID` | — | — | Spotify Client ID (raises spotDL's rate limits; optional) |
-| `SPOTDL_ADDON_CLIENT_SECRET` | — | — | Spotify Client Secret (optional) |
-| `SPOTDL_ADDON_BINARY` | — | `spotdl` | spotdl binary path |
-| `SPOTDL_ADDON_COOKIES` | — | — | Netscape cookies.txt path (unblocks a flagged IP) |
-| `SPOTDL_ADDON_DOWNLOADS_DIR` | — | `/data/downloads` | staging dir |
-| `SPOTDL_ADDON_PORT` | — | `8587` | HTTP listen port |
+| Env var                      | Required | Default           | Purpose                                                   |
+| ---------------------------- | -------- | ----------------- | --------------------------------------------------------- |
+| `SPOTDL_ADDON_TOKEN`         | **yes**  | —                 | Bearer token core authenticates with                      |
+| `SPOTDL_ADDON_CLIENT_ID`     | —        | —                 | Spotify Client ID (raises spotDL's rate limits; optional) |
+| `SPOTDL_ADDON_CLIENT_SECRET` | —        | —                 | Spotify Client Secret (optional)                          |
+| `SPOTDL_ADDON_BINARY`        | —        | `spotdl`          | spotdl binary path                                        |
+| `SPOTDL_ADDON_COOKIES`       | —        | —                 | Netscape cookies.txt path (unblocks a flagged IP)         |
+| `SPOTDL_ADDON_DOWNLOADS_DIR` | —        | `/data/downloads` | staging dir                                               |
+| `SPOTDL_ADDON_PORT`          | —        | `8587`            | HTTP listen port                                          |
 
 Only `GET /addon/v1/manifest` + `/health` are unauthenticated; every other route needs the bearer token.
 
