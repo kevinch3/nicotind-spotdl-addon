@@ -10,24 +10,34 @@
  * configFields are declared for parity with the yt-dlp addon.
  */
 export const SPOTDL_MANIFEST = {
-  id: 'spotdl-addon',
-  name: 'spotDL',
-  description: 'Download audio from Spotify track/album/playlist URLs (matched via spotDL).',
-  version: '0.1.0',
-  protocolVersion: '1.0.0',
-  kind: 'acquisition',
-  capabilities: ['resolve'],
-  urlPatterns: ['spotify\\.com'],
+  id: "spotdl-addon",
+  name: "spotDL",
+  description:
+    "Download audio from Spotify track/album/playlist URLs (matched via spotDL).",
+  version: "0.2.0",
+  // 1.1: this addon fills `AddonJob.title` (the playlist/album name).
+  protocolVersion: "1.1.0",
+  kind: "acquisition",
+  capabilities: ["resolve"],
+  urlPatterns: ["spotify\\.com"],
   configFields: [
-    { key: 'binaryPath', label: 'spotdl binary path', type: 'text' },
-    { key: 'cookiesFile', label: 'Cookies file (Netscape format) path', type: 'text' },
-    { key: 'clientId', label: 'Spotify Client ID (optional)', type: 'text' },
-    { key: 'clientSecret', label: 'Spotify Client Secret (optional)', type: 'password' },
+    { key: "binaryPath", label: "spotdl binary path", type: "text" },
+    {
+      key: "cookiesFile",
+      label: "Cookies file (Netscape format) path",
+      type: "text",
+    },
+    { key: "clientId", label: "Spotify Client ID (optional)", type: "text" },
+    {
+      key: "clientSecret",
+      label: "Spotify Client Secret (optional)",
+      type: "password",
+    },
   ],
   compliance: {
     disclaimer:
-      'spotDL matches Spotify metadata to audio downloaded from YouTube. You are responsible ' +
-      'for complying with the relevant Terms of Service and with copyright law in your jurisdiction.',
+      "spotDL matches Spotify metadata to audio downloaded from YouTube. You are responsible " +
+      "for complying with the relevant Terms of Service and with copyright law in your jurisdiction.",
     requiresConsent: true,
   },
 } as const;

@@ -1,8 +1,18 @@
-import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
-import { Database } from 'bun:sqlite';
-import type { AddonJob, AddonJobItem } from '@nicotind/addon-sdk';
-import { resolveSpotdl, type SpotdlConfig, type ResolveDeps } from './resolve.js';
+import { randomUUID } from "node:crypto";
+import { join, basename, extname, dirname } from "node:path";
+import { Database } from "bun:sqlite";
+import type {
+  AddonJob,
+  AddonJobItem,
+  DownloaderTrackEvent,
+} from "@nicotind/addon-sdk";
+import {
+  runSpotdl,
+  type SpotdlConfig,
+  type ResolveDeps,
+  type ResolvedFile,
+  type RunningResolve,
+} from "./resolve.js";
 
 interface JobEntry {
   job: AddonJob;
@@ -15,12 +25,65 @@ interface JobRow {
   files_json: string;
 }
 
+const USERNAME = "spotdl-addon";
+
+/** Fold a song label / filename to a comparison key (see `matchFilesToItems`). */
+export function trackKey(s: string): string {
+  return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Pair the files that landed with the tracks spotDL reported. spotDL names a
+ * song `Artist - Title` in its log and files it as `<stage>/<artist>/<album>/
+ * <title>.<ext>` — so `<artist dir> - <stem>` is the same label, modulo the
+ * characters spotDL strips from filenames, which `trackKey` drops from both
+ * sides. Returns the item index each file belongs to, or -1 for a file no
+ * reported track claims (it still ships — it is real audio).
+ */
+export function matchFilesToItems(
+  files: ResolvedFile[],
+  titles: ReadonlyArray<string | null>,
+): number[] {
+  const byKey = new Map<string, number>();
+  titles.forEach((t, i) => {
+    if (t) byKey.set(trackKey(t), i);
+  });
+  const claimed = new Set<number>();
+  return files.map((f) => {
+    const stem = basename(f.path, extname(f.path));
+    const artist = basename(dirname(dirname(f.path)));
+    for (const key of [trackKey(`${artist} - ${stem}`), trackKey(stem)]) {
+      const idx = byKey.get(key);
+      if (idx !== undefined && !claimed.has(idx)) {
+        claimed.add(idx);
+        return idx;
+      }
+    }
+    return -1;
+  });
+}
+
 /**
  * SQLite-backed job store (issue #515). `create` returns an active job
  * immediately and resolves the URL in the background (spotDL runs for
  * seconds/minutes), so core's poll sees an in-flight job flip to `done` with
  * `fileReady` items — the exact loop the archive/slskd/yt-dlp addons use. Files
  * stage under `<stagingBase>/<jobId>/`.
+ *
+ * **What a job reports** (NicotinD issue #585): this store used to glob staging
+ * after spotDL exited and call whatever it found a complete job — so a playlist
+ * of 16 where one track came through read as a clean "Done 1 of 1" under the
+ * source label, and the addon kept no record of why. Now spotDL's output is
+ * read as it runs: the list's name becomes `AddonJob.title`, every
+ * `Downloaded`/`Skipping`/failed line becomes an item **in that order**, and a
+ * shortfall against the announced total is filled with `unavailable`
+ * placeholders so the host's count is honest. The job closes `done` only when
+ * every track landed, `partial` with spotDL's own error lines otherwise, and
+ * `failed` when nothing did.
  *
  * **Why persist** (the ghost-card fix): jobs used to live only in memory, so a
  * restart mid-download dropped them and core's cursor poll never revisited them
@@ -32,13 +95,15 @@ interface JobRow {
  */
 export class JobStore {
   private jobs = new Map<string, JobEntry>();
+  private running = new Map<string, RunningResolve>();
   private db: Database;
 
   constructor(
     private readonly stagingBase: string,
     private readonly config: () => SpotdlConfig,
     private readonly deps: ResolveDeps = {},
-    dbPath = ':memory:',
+    dbPath = ":memory:",
+    private readonly log: (line: string) => void = (line) => console.log(line),
   ) {
     this.db = new Database(dbPath);
     this.db.run(`
@@ -60,7 +125,9 @@ export class JobStore {
    * it ghost forever.
    */
   private hydrate(): void {
-    const rows = this.db.query<JobRow, []>(`SELECT id, job_json, files_json FROM jobs`).all();
+    const rows = this.db
+      .query<JobRow, []>(`SELECT id, job_json, files_json FROM jobs`)
+      .all();
     for (const row of rows) {
       let entry: JobEntry;
       try {
@@ -74,9 +141,10 @@ export class JobStore {
         this.db.run(`DELETE FROM jobs WHERE id = ?`, [row.id]);
         continue;
       }
-      if (entry.job.state === 'active') {
-        entry.job.state = 'failed';
-        entry.job.error = 'The addon restarted while this download was in progress.';
+      if (entry.job.state === "active") {
+        entry.job.state = "failed";
+        entry.job.error =
+          "The addon restarted while this download was in progress.";
         entry.job.updatedAt = Date.now();
         this.persist(entry);
       }
@@ -107,13 +175,11 @@ export class JobStore {
     const id = randomUUID();
     const job: AddonJob = {
       id,
-      // The published @nicotind/addon-sdk@0.1.0 predates the 'url' intent (shipped
-      // in core, unpublished). Core's manifest/job schema accepts it; drop this
-      // cast once addon-sdk ^0.1.1 (with 'url') is published + this dep bumps.
-      intent: 'url' as unknown as AddonJob['intent'],
+      intent: "url",
       artist: null,
       album: null,
-      state: 'active',
+      title: null,
+      state: "active",
       error: null,
       items: [],
       createdAt: Date.now(),
@@ -127,31 +193,114 @@ export class JobStore {
   }
 
   private async run(id: string, url: string, entry: JobEntry): Promise<void> {
-    try {
-      const files = await resolveSpotdl(url, join(this.stagingBase, id), this.config(), this.deps);
-      if (files.length === 0) throw new Error('spotDL produced no audio files');
-      entry.job.items = files.map((f, i): AddonJobItem => {
-        const itemId = `${id}:${i}`;
-        entry.paths.set(itemId, f.path);
-        return {
-          itemId,
-          title: null,
-          username: 'spotdl-addon',
-          filename: f.filename,
-          size: f.size,
-          state: 'completed',
-          fileReady: true,
-          updatedAt: Date.now(),
-        };
-      });
-      entry.job.state = 'done';
-      entry.job.updatedAt = Date.now();
-    } catch (err) {
-      entry.job.state = 'failed';
-      entry.job.error = err instanceof Error ? err.message : String(err);
-      entry.job.updatedAt = Date.now();
-    } finally {
+    const { job } = entry;
+    let expected = 0;
+    let seq = 0;
+    const touch = (): void => {
+      job.updatedAt = Date.now();
       this.persist(entry);
+    };
+    const item = (
+      title: string | null,
+      state: AddonJobItem["state"],
+    ): AddonJobItem => ({
+      itemId: `${id}:${seq++}`,
+      title,
+      username: USERNAME,
+      filename: "",
+      size: 0,
+      state,
+      fileReady: false,
+      updatedAt: Date.now(),
+    });
+    const onTrack = (ev: DownloaderTrackEvent): void => {
+      // spotDL reports each song once, when it is finished with it; a second
+      // line for the same title (a retry) updates rather than duplicates.
+      const existing = job.items.find((i) => i.title === ev.title);
+      const state: AddonJobItem["state"] =
+        ev.status === "failed" ? "unavailable" : "completed";
+      if (existing) {
+        existing.state = state;
+        existing.updatedAt = Date.now();
+      } else {
+        job.items.push(item(ev.title, state));
+      }
+      touch();
+    };
+
+    try {
+      const running = runSpotdl(
+        url,
+        join(this.stagingBase, id),
+        this.config(),
+        this.deps,
+        {
+          onTitle: (title) => {
+            job.title = title;
+            touch();
+          },
+          onTotal: (total) => {
+            expected = total;
+          },
+          onTrack,
+          onOutput: (line) => this.log(`[spotdl ${id.slice(0, 8)}] ${line}`),
+        },
+      );
+      this.running.set(id, running);
+      const result = await running.done;
+      if (job.state === "cancelled") return; // `cancel()` already closed it
+
+      // Attach the files that landed to the tracks that reported them.
+      const owner = matchFilesToItems(
+        result.files,
+        job.items.map((i) => i.title),
+      );
+      result.files.forEach((f, fi) => {
+        let target = owner[fi]! >= 0 ? job.items[owner[fi]!]! : undefined;
+        if (!target) {
+          target = item(basename(f.path, extname(f.path)), "completed");
+          job.items.push(target);
+        }
+        target.state = "completed";
+        target.fileReady = true;
+        target.filename = f.filename;
+        target.size = f.size;
+        target.updatedAt = Date.now();
+        entry.paths.set(target.itemId, f.path);
+      });
+      // A track spotDL said it downloaded but whose file is not there is not
+      // deliverable — say so rather than hand the host an item it can't fetch.
+      for (const i of job.items) {
+        if (i.state === "completed" && !i.fileReady) i.state = "unavailable";
+      }
+      // The announced total is the honest denominator: tracks spotDL never
+      // mentioned (it died before reaching them) become unavailable placeholders.
+      for (let n = job.items.length; n < expected; n++)
+        job.items.push(item(null, "unavailable"));
+
+      const landed = job.items.filter((i) => i.fileReady).length;
+      const reasons = result.errorLines.slice(-5).join("\n");
+      if (landed === 0) {
+        job.state = "failed";
+        job.error =
+          reasons ||
+          result.outputTail.trim() ||
+          `spotDL exited with code ${result.exitCode}`;
+      } else if (landed < job.items.length) {
+        job.state = "partial";
+        job.error = `Downloaded ${landed} of ${job.items.length} tracks — the rest failed or were skipped.${
+          reasons ? `\n${reasons}` : ""
+        }`;
+      } else {
+        job.state = "done";
+        job.error = null;
+      }
+    } catch (err) {
+      job.state = "failed";
+      job.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      this.running.delete(id);
+      touch();
     }
   }
 
@@ -160,10 +309,33 @@ export class JobStore {
   }
 
   list(sinceMs = 0): AddonJob[] {
-    return [...this.jobs.values()].map((e) => e.job).filter((j) => j.updatedAt > sinceMs);
+    return [...this.jobs.values()]
+      .map((e) => e.job)
+      .filter((j) => j.updatedAt > sinceMs);
+  }
+
+  /**
+   * Stop an in-flight job: SIGTERM spotDL and close the job `cancelled` with
+   * every undelivered item `unavailable`. The host called this route before
+   * and got a 404 — the route did not exist, so "Cancel" on a running Spotify
+   * download read as an addon error. A job already settled is left alone.
+   */
+  cancel(id: string): boolean {
+    const entry = this.jobs.get(id);
+    if (!entry || entry.job.state !== "active") return false;
+    this.running.get(id)?.cancel();
+    for (const i of entry.job.items) {
+      if (!i.fileReady) i.state = "unavailable";
+    }
+    entry.job.state = "cancelled";
+    entry.job.error = "Cancelled.";
+    entry.job.updatedAt = Date.now();
+    this.persist(entry);
+    return true;
   }
 
   remove(id: string): void {
+    this.cancel(id);
     this.jobs.delete(id);
     this.db.run(`DELETE FROM jobs WHERE id = ?`, [id]);
   }
