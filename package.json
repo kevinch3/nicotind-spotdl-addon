@@ -17,7 +17,7 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@nicotind/addon-sdk": "^0.1.1",
+    "@nicotind/addon-sdk": "^0.1.2",
     "hono": "^4.12.31",
     "zod": "^4.4.3"
   },

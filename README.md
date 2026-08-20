@@ -27,6 +27,11 @@ are mitigated by the **bgutil PO-token provider** run as a **sidecar** (the imag
 `bgutil-ytdlp-pot-provider` plugin; spotDL can't thread extractor-args, so the sidecar must be
 reachable at the plugin's default `127.0.0.1:4416` — share the network namespace).
 
+The image pins **yt-dlp to the PyPI version current at build time** (`--build-arg YTDLP_VERSION`,
+resolved by CI). It used to be "latest", which a cached Docker layer silently froze for weeks while
+YouTube moved on — every media fetch 403'd (NicotinD #588). Rebuild the image to pick up a newer
+yt-dlp; a local build needs the arg: `docker build --build-arg YTDLP_VERSION=$(curl -fsS https://pypi.org/pypi/yt-dlp/json | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])') .`
+
 ## Run (Docker)
 
 ```bash

@@ -49,6 +49,16 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+      # The version goes into the pip layer's command line so the Docker layer
+      # cache can never pin an old yt-dlp again (NicotinD #588) — and it is
+      # printed here so the run says which one shipped.
+      - name: Resolve yt-dlp version
+        id: ytdlp
+        run: |
+          v=$(curl -fsS https://pypi.org/pypi/yt-dlp/json | python3 -c 'import sys,json; print(json.load(sys.stdin)["info"]["version"])')
+          test -n "$v"
+          echo "yt-dlp $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Build (push on push events)
         uses: docker/build-push-action@v6
         with:
@@ -56,5 +66,7 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            YTDLP_VERSION=${{ steps.ytdlp.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
