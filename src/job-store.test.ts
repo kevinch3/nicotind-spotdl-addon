@@ -11,6 +11,7 @@ function spotdlThat(
   lines: string[],
   files: Array<[string, string, string]>,
   code = 0,
+  gate?: Promise<unknown>,
 ) {
   return ((bin: string, args: string[], opts?: unknown) => {
     const outIdx = args.indexOf("--output");
@@ -18,6 +19,7 @@ function spotdlThat(
     return fakeSpawn({
       lines,
       code,
+      gate,
       writeTo: () => {
         for (const [artist, album, title] of files) {
           mkdirSync(join(base, artist, album), { recursive: true });
@@ -39,6 +41,14 @@ async function waitDone(store: JobStore, id: string): Promise<void> {
     await new Promise((r) => setTimeout(r, 5));
   }
   throw new Error("job never left active");
+}
+
+async function waitFor(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 400; i++) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error("condition never held");
 }
 
 const cfg = () => ({ binaryPath: "spotdl" });
@@ -231,7 +241,11 @@ describe("what a job reports (NicotinD #585)", () => {
     const mid = store.get(job.id)!;
     expect(mid.state).toBe("active");
     expect(mid.title).toBe("Live Mix");
-    expect(mid.items.map((i) => i.title)).toEqual(["A - One"]);
+    // "Found 2 songs" is announced up front, so the poll sees both seats: the
+    // one that landed, plus a `queued` placeholder for the one still to come
+    // (NicotinD #595 — the denominator must not grow under the user).
+    expect(mid.items.map((i) => i.title)).toEqual(["A - One", null]);
+    expect(mid.items.map((i) => i.state)).toEqual(["completed", "queued"]);
     expect(mid.updatedAt).toBeGreaterThan(job.createdAt - 1);
     // …and cancel closes it with the undelivered track unavailable.
     expect(store.cancel(job.id)).toBe(true);
@@ -348,5 +362,134 @@ describe("JobStore persistence (issue #515)", () => {
     s2.remove("j2");
     const s3 = new JobStore(stage, cfg, {}, db, quiet);
     expect(s3.get("j2")).toBeUndefined();
+  });
+});
+
+describe("the announced total is honest from the first poll (NicotinD #595)", () => {
+  it("shows N queued placeholders as soon as spotDL announces the count", async () => {
+    const { stage } = tmp();
+    let release = (): void => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const store = new JobStore(
+      stage,
+      cfg,
+      {
+        spawn: spotdlThat(
+          [
+            "Found 14 songs in Opera Bangers (Playlist)",
+            'Downloaded "A - One": https://y/1',
+          ],
+          [["A", "Alb", "One"]],
+          0,
+          gate,
+        ),
+      },
+      ":memory:",
+      quiet,
+    );
+    const job = store.create("https://open.spotify.com/playlist/x");
+    // Poll as core would, while spotDL is still mid-run.
+    await waitFor(() => (store.get(job.id)?.items.length ?? 0) >= 14);
+    const mid = store.get(job.id)!;
+    expect(mid.items).toHaveLength(14);
+    expect(mid.items.filter((i) => i.state === "queued").length).toBeGreaterThan(
+      0,
+    );
+    // The card reads "1 of 14", never "1 of 1".
+    expect(mid.items.filter((i) => i.state === "completed")).toHaveLength(1);
+
+    release();
+    await waitDone(store, job.id);
+    const got = store.get(job.id)!;
+    expect(got.items).toHaveLength(14);
+    // Nothing is left `queued` once the run is over.
+    expect(got.items.some((i) => i.state === "queued")).toBe(false);
+    expect(got.items.filter((i) => i.fileReady)).toHaveLength(1);
+    expect(got.state).toBe("partial");
+  });
+});
+
+describe("jobs are serialized so YouTube does not rate-limit us (NicotinD #601)", () => {
+  it("runs one spotDL at a time and queues the rest", async () => {
+    const { stage } = tmp();
+    let live = 0;
+    let peak = 0;
+    let release = (): void => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const spawn = ((bin: string, args: string[], opts?: unknown) => {
+      live++;
+      peak = Math.max(peak, live);
+      return spotdlThat(
+        ["Found 1 songs in X (Playlist)", 'Downloaded "A - One": https://y/1'],
+        [["A", "Alb", "One"]],
+        0,
+        gate.then(() => {
+          live--;
+        }),
+      )(bin, args, opts as never);
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const store = new JobStore(stage, cfg, { spawn }, ":memory:", quiet);
+    const a = store.create("https://open.spotify.com/playlist/a");
+    const b = store.create("https://open.spotify.com/playlist/b");
+    const c = store.create("https://open.spotify.com/playlist/c");
+
+    // Both later jobs exist and are visible to core immediately...
+    expect(store.get(b.id)).toBeTruthy();
+    expect(store.get(c.id)).toBeTruthy();
+    release();
+    await waitDone(store, a.id);
+    await waitDone(store, b.id);
+    await waitDone(store, c.id);
+    // ...but only one spotDL was ever alive.
+    expect(peak).toBe(1);
+  });
+
+  it("cancelling a job that has not started yet never spawns spotDL", async () => {
+    const { stage } = tmp();
+    let spawned = 0;
+    let release = (): void => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const spawn = ((bin: string, args: string[], opts?: unknown) => {
+      spawned++;
+      return spotdlThat(
+        ["Found 1 songs in X (Playlist)", 'Downloaded "A - One": https://y/1'],
+        [["A", "Alb", "One"]],
+        0,
+        gate,
+      )(bin, args, opts as never);
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const store = new JobStore(stage, cfg, { spawn }, ":memory:", quiet);
+    const a = store.create("https://open.spotify.com/playlist/a");
+    const b = store.create("https://open.spotify.com/playlist/b");
+    // b is queued behind a, so cancelling it has no process to signal — the
+    // queue must drop it rather than start it when a finishes.
+    expect(store.cancel(b.id)).toBe(true);
+    release();
+    await waitDone(store, a.id);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(store.get(b.id)!.state).toBe("cancelled");
+    expect(spawned).toBe(1);
+  });
+
+  it("a job that throws still lets the queue drain", async () => {
+    const { stage } = tmp();
+    const spawn = (() => {
+      throw new Error("spawn failed");
+    }) as unknown as typeof import("node:child_process").spawn;
+    const store = new JobStore(stage, cfg, { spawn }, ":memory:", quiet);
+    const a = store.create("https://open.spotify.com/playlist/a");
+    const b = store.create("https://open.spotify.com/playlist/b");
+    await waitDone(store, a.id);
+    await waitDone(store, b.id);
+    expect(store.get(a.id)!.state).toBe("failed");
+    expect(store.get(b.id)!.state).toBe("failed");
   });
 });

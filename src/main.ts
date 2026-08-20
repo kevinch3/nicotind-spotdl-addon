@@ -17,6 +17,10 @@ const config = (): SpotdlConfig => ({
   // Optional — raise spotDL's Spotify rate limits over its shared client.
   clientId: process.env.SPOTDL_ADDON_CLIENT_ID || undefined,
   clientSecret: process.env.SPOTDL_ADDON_CLIENT_SECRET || undefined,
+  // Cap spotDL's own fan-out; jobs are serialized in JobStore (issue #601).
+  threads: process.env.SPOTDL_ADDON_THREADS
+    ? Number(process.env.SPOTDL_ADDON_THREADS)
+    : undefined,
 });
 
 const stagingBase = process.env.SPOTDL_ADDON_DOWNLOADS_DIR ?? "/data/downloads";
