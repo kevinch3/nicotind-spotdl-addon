@@ -12,13 +12,22 @@ RUN apt-get update \
 # Deno — spotDL's embedded yt-dlp needs a JS runtime for signature challenges.
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
-# spotDL is unpinned (latest) — it and its embedded yt-dlp track YouTube's
-# continuous breakage, matching the monorepo's own image. BGUTIL_VERSION pins the
-# provider plugin to the pot-provider sidecar image (same default as the monorepo;
-# override to move both in lockstep).
+# YTDLP_VERSION is resolved from PyPI by CI at build time (ci.yml "Resolve
+# yt-dlp version") and passed as a build-arg. It used to be "unpinned (latest)"
+# — but `pip install yt-dlp` in a Dockerfile is Docker-layer-cached, so a
+# rebuild reused a six-week-old layer while YouTube had moved on: every media
+# fetch 403'd and a 100-track playlist landed 1 (NicotinD #588). A version in
+# the layer's command line is what makes the cache key move with PyPI, and the
+# build log now states which yt-dlp shipped. spotDL itself stays unpinned (it
+# drives this yt-dlp). BGUTIL_VERSION pins the provider plugin to the
+# pot-provider sidecar image (same default as the monorepo; override to move
+# both in lockstep).
+ARG YTDLP_VERSION
 ARG BGUTIL_VERSION=1.3.1
-RUN pip3 install --no-cache-dir --break-system-packages --upgrade \
+RUN test -n "${YTDLP_VERSION}" || { echo "YTDLP_VERSION build-arg is required (see ci.yml)"; exit 1; } \
+  && pip3 install --no-cache-dir --break-system-packages --upgrade \
   spotdl \
+  "yt-dlp==${YTDLP_VERSION}" \
   "bgutil-ytdlp-pot-provider==${BGUTIL_VERSION}"
 
 WORKDIR /app
