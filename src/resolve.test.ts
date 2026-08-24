@@ -112,6 +112,18 @@ describe("buildArgs", () => {
       expect(n).toBeLessThanOrEqual(MAX_THREADS);
     }
   });
+
+  it("accepts several queries at once — the bounded per-track retry pass (issue #651 item C)", () => {
+    const args = buildArgs(
+      ["https://open.spotify.com/track/a", "https://open.spotify.com/track/b"],
+      "/stage",
+      { binaryPath: "spotdl" },
+    );
+    expect(args[0]).toBe("download");
+    expect(args[1]).toBe("https://open.spotify.com/track/a");
+    expect(args[2]).toBe("https://open.spotify.com/track/b");
+    expect(args[3]).toBe("--output");
+  });
 });
 
 describe("spotifyEnv", () => {

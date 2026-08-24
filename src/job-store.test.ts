@@ -30,6 +30,33 @@ function spotdlThat(
   }) as unknown as typeof import("node:child_process").spawn;
 }
 
+/**
+ * A spotDL that behaves differently on each successive invocation — one
+ * `JobStore.run()` can spawn spotDL more than once now (issue #651 item C:
+ * the bounded per-track retry pass). `calls` records the args of every
+ * invocation so a test can assert exactly which URLs a retry pass targeted.
+ */
+function spotdlPasses(
+  passes: Array<{
+    lines: string[];
+    files?: Array<[string, string, string]>;
+    code?: number;
+  }>,
+  calls: string[][] = [],
+) {
+  let n = 0;
+  return ((bin: string, args: string[], opts?: unknown) => {
+    calls.push(args);
+    const pass = passes[Math.min(n, passes.length - 1)]!;
+    n++;
+    return spotdlThat(pass.lines, pass.files ?? [], pass.code ?? 0)(
+      bin,
+      args,
+      opts as never,
+    );
+  }) as unknown as typeof import("node:child_process").spawn;
+}
+
 function tmp() {
   const dir = mkdtempSync(join(tmpdir(), "sps-persist-"));
   return { stage: join(dir, "downloads"), db: join(dir, "jobs.db") };
@@ -124,16 +151,25 @@ describe("what a job reports (NicotinD #585)", () => {
       stage,
       cfg,
       {
-        spawn: spotdlThat(
-          [
-            "Found 16 songs in Big Mix (Playlist)",
-            'Downloaded "Kaleb Di Masi - Techengue": https://y/1',
-            "https://open.spotify.com/track/2 - LookupError: No results found for song: X - Y",
-            "https://open.spotify.com/track/3 - AudioProviderError: YT-DLP download error",
-          ],
-          [["Kaleb Di Masi", "Techengue", "Techengue"]],
-          1,
-        ),
+        // track/3's AudioProviderError is transient, so it gets a retry pass
+        // (issue #651 item C) — still failing the same way there, so this
+        // job's outcome is unchanged from before that retry existed.
+        spawn: spotdlPasses([
+          {
+            lines: [
+              "Found 16 songs in Big Mix (Playlist)",
+              'Downloaded "Kaleb Di Masi - Techengue": https://y/1',
+              "https://open.spotify.com/track/2 - LookupError: No results found for song: X - Y",
+              "https://open.spotify.com/track/3 - AudioProviderError: YT-DLP download error",
+            ],
+            files: [["Kaleb Di Masi", "Techengue", "Techengue"]],
+            code: 1,
+          },
+          {
+            lines: ["https://open.spotify.com/track/3 - AudioProviderError: YT-DLP download error"],
+            code: 1,
+          },
+        ]),
       },
       ":memory:",
       quiet,
@@ -491,5 +527,204 @@ describe("jobs are serialized so YouTube does not rate-limit us (NicotinD #601)"
     await waitDone(store, b.id);
     expect(store.get(a.id)!.state).toBe("failed");
     expect(store.get(b.id)!.state).toBe("failed");
+  });
+});
+
+describe("bounded per-track retry on a transient failure (issue #651 item C)", () => {
+  it("recovers a transient failure with one retry pass, targeting only that track's URL", async () => {
+    const { stage } = tmp();
+    const calls: string[][] = [];
+    const store = new JobStore(
+      stage,
+      cfg,
+      {
+        spawn: spotdlPasses(
+          [
+            {
+              lines: [
+                "Found 2 songs in Mix (Playlist)",
+                'Downloaded "A - One": https://y/1',
+                "https://open.spotify.com/track/2 - JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+              ],
+              files: [["A", "Alb", "One"]],
+              code: 1,
+            },
+            {
+              lines: ['Downloaded "B - Two": https://y/2'],
+              files: [["B", "Alb", "Two"]],
+            },
+          ],
+          calls,
+        ),
+      },
+      ":memory:",
+      quiet,
+    );
+    const job = store.create("https://open.spotify.com/playlist/x");
+    await waitDone(store, job.id);
+    const got = store.get(job.id)!;
+
+    expect(calls).toHaveLength(2);
+    // The retry pass queries only the one track that failed transiently —
+    // never the original playlist URL, and never a track spotDL never
+    // reported a problem with.
+    expect(calls[1]).toContain("https://open.spotify.com/track/2");
+    expect(calls[1]).not.toContain("https://open.spotify.com/playlist/x");
+
+    expect(got.state).toBe("done");
+    expect(got.error).toBeNull();
+    expect(got.items).toHaveLength(2);
+    expect(got.items.filter((i) => i.fileReady)).toHaveLength(2);
+    expect(got.items.map((i) => i.title)).toEqual(["A - One", "B - Two"]);
+  });
+
+  it("never retries an unknown-class failure (a no-results miss)", async () => {
+    const { stage } = tmp();
+    const calls: string[][] = [];
+    const store = new JobStore(
+      stage,
+      cfg,
+      {
+        spawn: spotdlPasses(
+          [
+            {
+              lines: [
+                "Found 1 songs in Lonely (Saved)",
+                "https://t/1 - LookupError: No results found for song: A - B",
+              ],
+              code: 1,
+            },
+          ],
+          calls,
+        ),
+      },
+      ":memory:",
+      quiet,
+    );
+    const job = store.create("https://open.spotify.com/track/x");
+    await waitDone(store, job.id);
+    expect(calls).toHaveLength(1); // no retry pass spawned
+    expect(store.get(job.id)).toMatchObject({
+      state: "failed",
+      error: "https://t/1 - LookupError: No results found for song: A - B",
+    });
+  });
+
+  it("gives up after 2 retry passes, reporting the most recent reason", async () => {
+    const { stage } = tmp();
+    const calls: string[][] = [];
+    // AudioProviderError, not JSONDecodeError: this is a single-track job, so
+    // an empty-files JSONDecodeError result would also read as item A's
+    // whole-process preflight crash and take its own (real-timer) retry path
+    // — a different mechanism this test is not exercising.
+    const failLine =
+      "https://open.spotify.com/track/1 - AudioProviderError: YT-DLP download error - https://youtu.be/first";
+    const retryFailLine =
+      "https://open.spotify.com/track/1 - AudioProviderError: YT-DLP download error - https://youtu.be/retry";
+    const store = new JobStore(
+      stage,
+      cfg,
+      {
+        spawn: spotdlPasses(
+          [
+            { lines: ["Found 1 songs in X (Playlist)", failLine], code: 1 },
+            { lines: [retryFailLine], code: 1 },
+            { lines: [retryFailLine], code: 1 },
+          ],
+          calls,
+        ),
+      },
+      ":memory:",
+      quiet,
+    );
+    const job = store.create("https://open.spotify.com/playlist/x");
+    await waitDone(store, job.id);
+    // The initial run plus exactly 2 retry passes — never a 3rd.
+    expect(calls).toHaveLength(3);
+    expect(store.get(job.id)).toMatchObject({
+      state: "failed",
+      error: retryFailLine,
+    });
+  });
+
+  it("a batch of transient failures retries together in one pass, leaving an unknown failure untouched", async () => {
+    const { stage } = tmp();
+    const calls: string[][] = [];
+    const store = new JobStore(
+      stage,
+      cfg,
+      {
+        spawn: spotdlPasses(
+          [
+            {
+              lines: [
+                "Found 3 songs in Mix (Playlist)",
+                'Downloaded "A - One": https://y/1',
+                "https://open.spotify.com/track/2 - JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+                "https://open.spotify.com/track/3 - LookupError: No results found for song: X - Y",
+              ],
+              files: [["A", "Alb", "One"]],
+              code: 1,
+            },
+            {
+              lines: ['Downloaded "B - Two": https://y/2'],
+              files: [["B", "Alb", "Two"]],
+            },
+          ],
+          calls,
+        ),
+      },
+      ":memory:",
+      quiet,
+    );
+    const job = store.create("https://open.spotify.com/playlist/x");
+    await waitDone(store, job.id);
+    const got = store.get(job.id)!;
+
+    expect(calls).toHaveLength(2);
+    // Exactly the one transient URL — not the unknown one, not the succeeded one.
+    const retryQueries = calls[1]!.slice(1, calls[1]!.indexOf("--output"));
+    expect(retryQueries).toEqual(["https://open.spotify.com/track/2"]);
+
+    expect(got.state).toBe("partial");
+    expect(got.items.filter((i) => i.fileReady)).toHaveLength(2);
+    expect(got.error).toContain("Downloaded 2 of 3 tracks");
+    expect(got.error).toContain("LookupError: No results found for song: X - Y");
+    expect(got.error).not.toContain("JSONDecodeError");
+  });
+
+  it("cancelling mid-retry-pass stops it, leaving the track unavailable", async () => {
+    const { stage } = tmp();
+    let release = (): void => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let n = 0;
+    const spawn = ((bin: string, args: string[], opts?: unknown) => {
+      n++;
+      if (n === 1) {
+        // AudioProviderError, not JSONDecodeError: a single-track, empty-files
+        // JSONDecodeError result also reads as item A's own preflight crash,
+        // which takes a real-timer retry path this test is not exercising.
+        return spotdlThat(
+          [
+            "Found 1 songs in X (Playlist)",
+            "https://open.spotify.com/track/1 - AudioProviderError: YT-DLP download error - https://youtu.be/x",
+          ],
+          [],
+          1,
+        )(bin, args, opts as never);
+      }
+      // The retry pass hangs — gives the test a chance to cancel mid-retry.
+      return fakeSpawn({ hang: true })(bin, args, opts as never);
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const store = new JobStore(stage, cfg, { spawn }, ":memory:", quiet);
+    const job = store.create("https://open.spotify.com/playlist/x");
+    await waitFor(() => n >= 2); // the retry pass has started
+    expect(store.cancel(job.id)).toBe(true);
+    release();
+    await waitDone(store, job.id);
+    expect(store.get(job.id)!.state).toBe("cancelled");
   });
 });

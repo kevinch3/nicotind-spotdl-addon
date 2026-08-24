@@ -104,13 +104,13 @@ export function resolveThreads(threads: number | undefined): number {
 }
 
 export function buildArgs(
-  url: string,
+  queries: string | string[],
   stagingDir: string,
   cfg: SpotdlConfig,
 ): string[] {
   const args = [
     "download",
-    url,
+    ...(Array.isArray(queries) ? queries : [queries]),
     "--output",
     join(stagingDir, "{artist}", "{album}", "{title}.{output-ext}"),
     "--overwrite",
@@ -172,24 +172,25 @@ function globAudioFiles(dir: string): ResolvedFile[] {
 }
 
 /**
- * Spawn spotDL for `url`, downloading audio into `stagingDir`, streaming its
- * output through `hooks`, and settle with the files that landed plus what the
- * run said about itself. Success is the caller's call: spotDL exits non-zero on
- * a partial playlist, so the exit code alone decides nothing — the files and the
- * per-track events do. YouTube PO tokens come from the baked bgutil plugin
- * reaching the pot-provider sidecar at its default 127.0.0.1:4416 (shared
- * netns) — spotDL can't thread extractor-args, so this stays a compose-topology
- * contract.
+ * Spawn spotDL for `queries` — one URL for a normal job, several individual
+ * track URLs for a bounded per-track retry pass (issue #651 item C) — into
+ * `stagingDir`, streaming its output through `hooks`, and settle with the
+ * files that landed plus what the run said about itself. Success is the
+ * caller's call: spotDL exits non-zero on a partial playlist, so the exit
+ * code alone decides nothing — the files and the per-track events do.
+ * YouTube PO tokens come from the baked bgutil plugin reaching the
+ * pot-provider sidecar at its default 127.0.0.1:4416 (shared netns) — spotDL
+ * can't thread extractor-args, so this stays a compose-topology contract.
  */
 export function runSpotdl(
-  url: string,
+  queries: string | string[],
   stagingDir: string,
   cfg: SpotdlConfig,
   deps: ResolveDeps = {},
   hooks: RunHooks = {},
 ): RunningResolve {
   const spawn = deps.spawn ?? nodeSpawn;
-  const args = buildArgs(url, stagingDir, cfg);
+  const args = buildArgs(queries, stagingDir, cfg);
   const creds = spotifyEnv(cfg);
   const child: ChildProcess = spawn(cfg.binaryPath, args, {
     stdio: ["ignore", "pipe", "pipe"],
@@ -302,7 +303,7 @@ const DEFAULT_BASE_DELAY_MS = 2000;
  * the child process, or mid-backoff by short-circuiting the next attempt.
  */
 export function runSpotdlWithRetry(
-  url: string,
+  queries: string | string[],
   stagingDir: string,
   cfg: SpotdlConfig,
   deps: ResolveDeps = {},
@@ -321,7 +322,7 @@ export function runSpotdlWithRetry(
   const done = (async (): Promise<RunResult> => {
     let attempt = 1;
     for (;;) {
-      current = runSpotdl(url, stagingDir, cfg, deps, hooks);
+      current = runSpotdl(queries, stagingDir, cfg, deps, hooks);
       const result = await current.done;
       if (cancelled || attempt >= maxAttempts || !isPreflightThrottleCrash(result)) {
         return result;
