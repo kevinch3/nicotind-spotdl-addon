@@ -7,7 +7,7 @@ import type {
   DownloaderTrackEvent,
 } from "@nicotind/addon-sdk";
 import {
-  runSpotdl,
+  runSpotdlWithRetry,
   type SpotdlConfig,
   type ResolveDeps,
   type ResolvedFile,
@@ -280,7 +280,11 @@ export class JobStore {
     };
 
     try {
-      const running = runSpotdl(
+      // Preflight throttle crashes (issue #651 item A) retry the whole
+      // process with backoff; every other outcome — success, partial,
+      // any other crash — behaves exactly like the bare `runSpotdl` call
+      // this replaced.
+      const running = runSpotdlWithRetry(
         url,
         join(this.stagingBase, id),
         this.config(),

@@ -78,6 +78,25 @@ A playlist import is not latency-sensitive, so waiting costs the user nothing �
 never was before: a job **cancelled before it started**, which has no process to signal. The queue
 drops it rather than spawning spotDL for a download the user already closed.
 
+## A throttled preflight retries instead of crashing the whole job
+
+Serializing jobs fixed the *concurrency* half of #601, but a re-measure on prod (2026-08-23,
+issue #651) found the per-job success rate unchanged at **~9 %** — the fix moved the needle on
+symptom 2 (unavailable rate) not at all, because symptom 1 was still unbuilt. spotDL's own
+preflight (`check_ytmusic_connection`, called before it resolves a single track) crashes with a
+bare `JSONDecodeError` the moment YouTube Music returns one throttled, non-JSON response — the
+*whole job* dies with zero files and a raw Python traceback as its only output, before track 1.
+One playlist in the re-measure sample hit exactly this: `0 of 0`, nothing attempted.
+
+`runSpotdlWithRetry` (`resolve.ts`) wraps `runSpotdl` and retries the **whole process** —
+spotDL never gets far enough to retry internally — on that one specific signature
+(`isPreflightThrottleCrash`: zero files landed + that exact traceback tail), with exponential
+backoff and full jitter, up to 3 attempts total. Every other outcome (success, an honest
+partial playlist, any other crash) returns on the first attempt unchanged, so this cannot turn
+a real "nothing here" into a duplicate run. `JobStore` calls this instead of `runSpotdl` and
+needs no other change — same `RunningResolve` shape, `cancel()` still works mid-attempt or
+mid-backoff.
+
 ## The announced total is honest from the first poll
 
 spotDL prints `Found N songs` up front but reports tracks one at a time. The addon now pushes `N`
