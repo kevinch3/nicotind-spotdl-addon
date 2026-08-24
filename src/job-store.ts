@@ -7,7 +7,13 @@ import type {
   DownloaderTrackEvent,
 } from "@nicotind/addon-sdk";
 import {
+  classifyTrackFailure,
+  parseJobFailureSummary,
+  parseSpotdlTrackEvent,
+} from "@nicotind/addon-sdk";
+import {
   runSpotdlWithRetry,
+  type RunResult,
   type SpotdlConfig,
   type ResolveDeps,
   type ResolvedFile,
@@ -84,6 +90,13 @@ export function matchFilesToItems(
  * placeholders so the host's count is honest. The job closes `done` only when
  * every track landed, `partial` with spotDL's own error lines otherwise, and
  * `failed` when nothing did.
+ *
+ * **Bounded per-track retry** (issue #651 item C): before closing, any track
+ * that failed with a `transient` reason (`classifyTrackFailure`, shared with
+ * the Downloads card) gets up to 2 more focused spotDL passes — the whole
+ * batch of still-failing transient URLs in one invocation per pass, never one
+ * track at a time, since every invocation redoes YouTube Music's own
+ * preflight check regardless of how many tracks it's given.
  *
  * **Why persist** (the ghost-card fix): jobs used to live only in memory, so a
  * restart mid-download dropped them and core's cursor poll never revisited them
@@ -279,41 +292,12 @@ export class JobStore {
       touch();
     };
 
-    try {
-      // Preflight throttle crashes (issue #651 item A) retry the whole
-      // process with backoff; every other outcome — success, partial,
-      // any other crash — behaves exactly like the bare `runSpotdl` call
-      // this replaced.
-      const running = runSpotdlWithRetry(
-        url,
-        join(this.stagingBase, id),
-        this.config(),
-        this.deps,
-        {
-          onTitle: (title) => {
-            job.title = title;
-            touch();
-          },
-          onTotal: (total) => {
-            expected = total;
-            // Announce the whole set at once (NicotinD #595). spotDL prints
-            // "Found N songs" up front but reports tracks one at a time, so the
-            // card used to walk 0-of-1 -> 2-of-14 -> 7-of-32 as the denominator
-            // caught up. `queued` placeholders make the denominator honest from
-            // the first poll; each is claimed as its track lands.
-            for (let n = job.items.length; n < total; n++)
-              job.items.push(item(null, "queued"));
-            touch();
-          },
-          onTrack,
-          onOutput: (line) => this.log(`[spotdl ${id.slice(0, 8)}] ${line}`),
-        },
-      );
-      this.running.set(id, running);
-      const result = await running.done;
-      if (job.state === "cancelled") return; // `cancel()` already closed it
-
-      // Attach the files that landed to the tracks that reported them.
+    const stagingDir = join(this.stagingBase, id);
+    // Attach the files that landed to the tracks that reported them — shared
+    // by the initial run and every retry pass, since a retry pass's own
+    // `onTrack` (below) has already given a recovered item its real title by
+    // the time this runs.
+    const attachFiles = (result: RunResult): void => {
       const owner = matchFilesToItems(
         result.files,
         job.items.map((i) => i.title),
@@ -333,6 +317,121 @@ export class JobStore {
         target.updatedAt = Date.now();
         entry.paths.set(target.itemId, f.path);
       });
+    };
+
+    // Bounded per-track retry (issue #651 item C). A transient failure (a
+    // throttled search/fetch — `classifyTrackFailure`, shared with the
+    // Downloads card so both agree on which is which) is worth one more try;
+    // an unknown one (the source may genuinely lack it) is not. Keyed by the
+    // Spotify track URL, which is stable across passes even though the
+    // item's *title* is not — `--print-errors` reports a lookup miss under
+    // the song name and a yt-dlp miss under the YouTube URL it tried, so a
+    // later success (reported under the real "Artist - Title") could never
+    // be title-matched back to the failure that preceded it.
+    // A plain function, not an inline `job.state === "cancelled"` at each
+    // call site: `cancel()` mutates `job.state` during every `await` below,
+    // but tsc's control-flow narrowing does not know that — checking it more
+    // than once inline narrows the *type* away after the first check and the
+    // second is flagged as comparing types with "no overlap" (the same
+    // pitfall `startState` above exists to avoid, for the same field).
+    const isCancelled = (): boolean => job.state === "cancelled";
+    const failuresByUrl = new Map<string, { item: AddonJobItem; reason: string }>();
+    const recordFailures = (lines: string[]): void => {
+      for (const line of lines) {
+        const [failure] = parseJobFailureSummary(line);
+        if (!failure) continue;
+        const ev = parseSpotdlTrackEvent(line);
+        const match = ev && job.items.find((i) => i.title === ev.title);
+        // A later pass's failure line no longer title-matches (the item's
+        // title may already have been overwritten below) — fall back to the
+        // item this URL was already tied to.
+        const target = match ?? failuresByUrl.get(failure.url)?.item;
+        if (target) failuresByUrl.set(failure.url, { item: target, reason: failure.reason });
+      }
+    };
+
+    try {
+      // Preflight throttle crashes (issue #651 item A) retry the whole
+      // process with backoff; every other outcome — success, partial,
+      // any other crash — behaves exactly like the bare `runSpotdl` call
+      // this replaced.
+      const running = runSpotdlWithRetry(url, stagingDir, this.config(), this.deps, {
+        onTitle: (title) => {
+          job.title = title;
+          touch();
+        },
+        onTotal: (total) => {
+          expected = total;
+          // Announce the whole set at once (NicotinD #595). spotDL prints
+          // "Found N songs" up front but reports tracks one at a time, so the
+          // card used to walk 0-of-1 -> 2-of-14 -> 7-of-32 as the denominator
+          // caught up. `queued` placeholders make the denominator honest from
+          // the first poll; each is claimed as its track lands.
+          for (let n = job.items.length; n < total; n++)
+            job.items.push(item(null, "queued"));
+          touch();
+        },
+        onTrack,
+        onOutput: (line) => this.log(`[spotdl ${id.slice(0, 8)}] ${line}`),
+      });
+      this.running.set(id, running);
+      let result = await running.done;
+      if (isCancelled()) return; // `cancel()` already closed it
+      attachFiles(result);
+      recordFailures(result.errorLines);
+
+      const MAX_RETRY_PASSES = 2;
+      for (let pass = 0; pass < MAX_RETRY_PASSES; pass++) {
+        const retryUrls = [...failuresByUrl.entries()]
+          .filter(([, r]) => classifyTrackFailure(r.reason) === "transient")
+          .map(([u]) => u);
+        if (retryUrls.length === 0) break;
+
+        // One spotDL invocation for every URL still failing, not one per
+        // track: every invocation redoes YouTube Music's preflight check, so
+        // N single-track retries would cost N extra requests against the
+        // very throttle this is trying to relieve. `threads: 1` makes event
+        // *arrival* order match query order for this pass — spotDL's own
+        // pool can otherwise interleave a multi-query run's per-track
+        // events, and nothing here could tell that interleaving apart.
+        let queryIdx = 0;
+        const assignedThisPass = new Map<string, AddonJobItem>();
+        const retryOnTrack = (ev: DownloaderTrackEvent): void => {
+          let target = assignedThisPass.get(ev.title);
+          if (!target) {
+            const url = retryUrls[queryIdx];
+            queryIdx++;
+            const rec = url ? failuresByUrl.get(url) : undefined;
+            if (!rec) return; // more events than queried URLs; ignore defensively
+            target = rec.item;
+            assignedThisPass.set(ev.title, target);
+          }
+          target.title = ev.title;
+          target.state = ev.status === "failed" ? "unavailable" : "completed";
+          target.updatedAt = Date.now();
+          touch();
+        };
+
+        const retry = runSpotdlWithRetry(
+          retryUrls,
+          stagingDir,
+          { ...this.config(), threads: 1 },
+          this.deps,
+          {
+            onTrack: retryOnTrack,
+            onOutput: (line) => this.log(`[spotdl ${id.slice(0, 8)}] ${line}`),
+          },
+        );
+        this.running.set(id, retry);
+        result = await retry.done;
+        if (isCancelled()) return;
+        attachFiles(result);
+        for (const url of retryUrls) {
+          if (failuresByUrl.get(url)?.item.fileReady) failuresByUrl.delete(url);
+        }
+        recordFailures(result.errorLines);
+      }
+
       // A track spotDL said it downloaded but whose file is not there is not
       // deliverable — say so rather than hand the host an item it can't fetch.
       for (const i of job.items) {
@@ -347,7 +446,10 @@ export class JobStore {
         job.items.push(item(null, "unavailable"));
 
       const landed = job.items.filter((i) => i.fileReady).length;
-      const reasons = result.errorLines.slice(-5).join("\n");
+      const reasons = [...failuresByUrl.entries()]
+        .map(([u, r]) => `${u} - ${r.reason}`)
+        .slice(-5)
+        .join("\n");
       if (landed === 0) {
         job.state = "failed";
         job.error =

@@ -97,6 +97,27 @@ a real "nothing here" into a duplicate run. `JobStore` calls this instead of `ru
 needs no other change — same `RunningResolve` shape, `cancel()` still works mid-attempt or
 mid-backoff.
 
+## A transient per-track failure gets a bounded second try
+
+Item A retries a job that dies before track 1. Item C (#651) covers the far more common case: a
+job that gets partway through and leaves some tracks behind. `classifyTrackFailure` (shared with
+the Downloads card, via `@nicotind/addon-sdk`) already knows which of those are worth retrying —
+`transient` (a throttled search or a refused fetch) versus `unknown` (the source may genuinely not
+have it, and under throttling that line is indistinguishable from a rate-limited miss either way).
+
+`JobStore.run` gives every `transient` failure up to **2** more passes, batched — every still-
+failing URL from one pass in a single spotDL invocation, not one call per track. That's not a
+minor optimisation: every spotDL invocation redoes YouTube Music's own preflight check
+(`check_ytmusic_connection`) regardless of how many tracks it's asked for, so N single-track
+retries would cost N extra requests against the exact throttle this exists to relieve.
+
+A batched retry pass forces `--threads 1`. That's what makes it safe: spotDL's own thread pool
+can otherwise interleave a multi-query run's per-track events, and nothing in a job's `items`
+records which query a given event belongs to — only *arrival order matching query order*, which
+sequential processing guarantees and concurrent processing does not. `unknown`-class failures are
+never touched; the loop stops the moment nothing left is `transient`, or after 2 passes, whichever
+comes first.
+
 ## The announced total is honest from the first poll
 
 spotDL prints `Found N songs` up front but reports tracks one at a time. The addon now pushes `N`
