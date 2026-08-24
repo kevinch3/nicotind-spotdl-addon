@@ -10,8 +10,13 @@ import {
   MAX_THREADS,
   spotifyEnv,
   runSpotdl,
+  runSpotdlWithRetry,
+  isPreflightThrottleCrash,
   PLAIN_OUTPUT_ENV,
+  type RunResult,
 } from "./resolve.js";
+
+type SpawnFn = typeof import("node:child_process").spawn;
 
 /**
  * A fake spotDL: writes `lines` to stdout (one per chunk, so a line split
@@ -203,5 +208,200 @@ describe("runSpotdl", () => {
     const result = await run.done;
     expect(capture.killed).toBe("SIGTERM");
     expect(result.exitCode).toBeNull();
+  });
+});
+
+/** A trimmed but faithful capture of the real crash (NicotinD #601 symptom 1,
+ *  reconfirmed on prod 2026-08-23 — issue #651 item A): spotDL's preflight
+ *  `check_ytmusic_connection()` dies on a throttled, non-JSON YouTube Music
+ *  response before a single track is attempted. */
+const PREFLIGHT_CRASH_TAIL = [
+  "╭──────────── Traceback (most recent call last) ────────────╮",
+  "│ .../spotdl/console/entry_point.py:100 in entry_point       │",
+  "│ ❱ 100 │   │   if not check_ytmusic_connection():            │",
+  "│ .../spotdl/utils/downloader.py:21 in check_ytmusic_connection │",
+  "│ .../json/decoder.py:363 in raw_decode                      │",
+  "╰──────────────────────────────────────────────────────────╯",
+  "JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+].join("\n");
+
+function fakeResult(overrides: Partial<RunResult> = {}): RunResult {
+  return {
+    files: [],
+    exitCode: 1,
+    errorLines: [],
+    outputTail: "",
+    ...overrides,
+  };
+}
+
+describe("isPreflightThrottleCrash", () => {
+  it("is true for spotDL's preflight JSONDecodeError with no files landed", () => {
+    expect(
+      isPreflightThrottleCrash(
+        fakeResult({ outputTail: PREFLIGHT_CRASH_TAIL }),
+      ),
+    ).toBe(true);
+  });
+
+  it("is false when a file landed, even alongside the same tail", () => {
+    expect(
+      isPreflightThrottleCrash(
+        fakeResult({
+          outputTail: PREFLIGHT_CRASH_TAIL,
+          files: [{ path: "/x/Song.mp3", filename: "Song.mp3", size: 1 }],
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false for a zero-file run that isn't this specific crash", () => {
+    expect(
+      isPreflightThrottleCrash(
+        fakeResult({ outputTail: "usage: spotdl [-h] ...\nerror: invalid URL" }),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("runSpotdlWithRetry", () => {
+  const stageFor = (tag: string): string =>
+    join(tmpdir(), `sp-retry-${process.pid}-${Date.now()}-${tag}`);
+
+  /** Every real-timer wait replaced with an immediately-resolving stub that
+   *  records what it was asked to sleep for. */
+  function fakeWaits(): {
+    wait: (ms: number) => Promise<void>;
+    delays: number[];
+  } {
+    const delays: number[] = [];
+    return {
+      delays,
+      wait: (ms: number) => {
+        delays.push(ms);
+        return Promise.resolve();
+      },
+    };
+  }
+
+  it("returns the first result untouched when spotDL succeeds outright", async () => {
+    let spawns = 0;
+    const spawn = fakeSpawn({
+      lines: ['Downloaded "Artist - Song": https://youtu.be/1'],
+      writeTo: () => {
+        mkdirSync(stageFor("ok"), { recursive: true });
+      },
+      code: 0,
+    });
+    const { wait, delays } = fakeWaits();
+    const run = runSpotdlWithRetry(
+      "https://open.spotify.com/album/x",
+      stageFor("ok"),
+      { binaryPath: "spotdl" },
+      {
+        spawn: ((...a: Parameters<typeof spawn>) => {
+          spawns++;
+          return spawn(...a);
+        }) as typeof spawn,
+      },
+      {},
+      { wait },
+    );
+    const result = await run.done;
+    expect(result.exitCode).toBe(0);
+    expect(spawns).toBe(1);
+    expect(delays).toEqual([]);
+  });
+
+  it("retries the whole process on a preflight throttle crash, then succeeds", async () => {
+    let spawns = 0;
+    const spawn = ((...a: Parameters<SpawnFn>) => {
+      spawns++;
+      const attempt = spawns;
+      return fakeSpawn({
+        lines: attempt === 1 ? [PREFLIGHT_CRASH_TAIL] : ["Found 1 songs in X (Playlist)"],
+        writeTo: attempt === 1 ? undefined : () => {},
+        code: attempt === 1 ? 1 : 0,
+      })(...a);
+    }) as SpawnFn;
+    const { wait, delays } = fakeWaits();
+    const onOutput: string[] = [];
+    const run = runSpotdlWithRetry(
+      "https://open.spotify.com/album/x",
+      stageFor("retry-ok"),
+      { binaryPath: "spotdl" },
+      { spawn },
+      { onOutput: (l) => onOutput.push(l) },
+      { wait, maxAttempts: 3, baseDelayMs: 1000, random: () => 0 },
+    );
+    const result = await run.done;
+    expect(spawns).toBe(2);
+    expect(result.exitCode).toBe(0);
+    expect(delays).toEqual([500]); // baseDelayMs * 2^0 * (0.5 + 0)
+    expect(onOutput.some((l) => /rate-limit/i.test(l))).toBe(true);
+  });
+
+  it("gives up after maxAttempts, surfacing the last crash rather than looping forever", async () => {
+    let spawns = 0;
+    const spawn = ((...a: Parameters<SpawnFn>) => {
+      spawns++;
+      return fakeSpawn({ lines: [PREFLIGHT_CRASH_TAIL], code: 1 })(...a);
+    }) as SpawnFn;
+    const { wait } = fakeWaits();
+    const run = runSpotdlWithRetry(
+      "https://open.spotify.com/album/x",
+      stageFor("retry-fail"),
+      { binaryPath: "spotdl" },
+      { spawn },
+      {},
+      { wait, maxAttempts: 3, random: () => 0 },
+    );
+    const result = await run.done;
+    expect(spawns).toBe(3);
+    expect(isPreflightThrottleCrash(result)).toBe(true);
+  });
+
+  it("does not retry a zero-file failure that isn't the preflight signature", async () => {
+    let spawns = 0;
+    const spawn = ((...a: Parameters<SpawnFn>) => {
+      spawns++;
+      return fakeSpawn({ lines: ["error: invalid URL"], code: 2 })(...a);
+    }) as SpawnFn;
+    const { wait } = fakeWaits();
+    const run = runSpotdlWithRetry(
+      "https://open.spotify.com/album/x",
+      stageFor("no-retry"),
+      { binaryPath: "spotdl" },
+      { spawn },
+      {},
+      { wait, maxAttempts: 3, random: () => 0 },
+    );
+    await run.done;
+    expect(spawns).toBe(1);
+  });
+
+  it("cancel() during the backoff wait stops it from spawning again", async () => {
+    let spawns = 0;
+    const spawn = ((...a: Parameters<SpawnFn>) => {
+      spawns++;
+      return fakeSpawn({ lines: [PREFLIGHT_CRASH_TAIL], code: 1 })(...a);
+    }) as SpawnFn;
+    let resolveWait: () => void = () => {};
+    const wait = () => new Promise<void>((r) => (resolveWait = r));
+    const run = runSpotdlWithRetry(
+      "https://open.spotify.com/album/x",
+      stageFor("cancel-mid-retry"),
+      { binaryPath: "spotdl" },
+      { spawn },
+      {},
+      { wait, maxAttempts: 3, random: () => 0 },
+    );
+    // Let the first attempt crash and the retry wait begin.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(run.cancel()).toBe(true);
+    resolveWait();
+    const result = await run.done;
+    expect(spawns).toBe(1);
+    expect(isPreflightThrottleCrash(result)).toBe(true);
   });
 });

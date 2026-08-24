@@ -259,3 +259,94 @@ export function runSpotdl(
     },
   };
 }
+
+/**
+ * spotDL's preflight (`check_ytmusic_connection`, called before it resolves a
+ * single track) crashes with a bare `JSONDecodeError` when YouTube Music
+ * returns a throttled, non-JSON response — a whole job dies with zero files
+ * and a raw Python traceback as its only output (NicotinD #601 symptom 1,
+ * reconfirmed on prod still happening — issue #651 item A). spotDL itself
+ * never retries this; the process either connects or dies on the first try.
+ */
+export function isPreflightThrottleCrash(result: RunResult): boolean {
+  return (
+    result.files.length === 0 &&
+    /JSONDecodeError: Expecting value/.test(result.outputTail)
+  );
+}
+
+export interface PreflightRetryOptions {
+  /** Total attempts, including the first. */
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  /** Injectable for tests — real callers get a real timer. */
+  wait?: (ms: number) => Promise<void>;
+  /** Injectable for tests — real callers get `Math.random`. */
+  random?: () => number;
+}
+
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_BASE_DELAY_MS = 2000;
+
+/**
+ * `runSpotdl`, retried whole-process on a preflight throttle crash
+ * (`isPreflightThrottleCrash`) with exponential backoff + jitter, up to
+ * `maxAttempts`. Any other outcome — success, a partial download, a crash
+ * that isn't this specific signature — returns on the first attempt
+ * unchanged; only the one known-transient failure mode is worth retrying,
+ * since spotDL still exits non-zero on an honest partial playlist and that
+ * must not trigger a second, duplicate run.
+ *
+ * Shares `RunningResolve`'s shape so callers (`JobStore`) need no changes
+ * beyond swapping the call: `cancel()` still stops the run — mid-attempt via
+ * the child process, or mid-backoff by short-circuiting the next attempt.
+ */
+export function runSpotdlWithRetry(
+  url: string,
+  stagingDir: string,
+  cfg: SpotdlConfig,
+  deps: ResolveDeps = {},
+  hooks: RunHooks = {},
+  opts: PreflightRetryOptions = {},
+): RunningResolve {
+  const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const baseDelayMs = opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  const wait =
+    opts.wait ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const random = opts.random ?? Math.random;
+
+  let current: RunningResolve | null = null;
+  let cancelled = false;
+
+  const done = (async (): Promise<RunResult> => {
+    let attempt = 1;
+    for (;;) {
+      current = runSpotdl(url, stagingDir, cfg, deps, hooks);
+      const result = await current.done;
+      if (cancelled || attempt >= maxAttempts || !isPreflightThrottleCrash(result)) {
+        return result;
+      }
+      hooks.onOutput?.(
+        `YouTube Music is rate-limiting spotDL's connection check — retrying (attempt ${
+          attempt + 1
+        } of ${maxAttempts})`,
+      );
+      // Full jitter over [0.5x, 1.5x) the doubling base, so a batch of jobs
+      // that all crashed together don't all retry on the same tick.
+      const delay = Math.round(
+        baseDelayMs * 2 ** (attempt - 1) * (0.5 + random()),
+      );
+      await wait(delay);
+      if (cancelled) return result;
+      attempt++;
+    }
+  })();
+
+  return {
+    done,
+    cancel: () => {
+      cancelled = true;
+      return current?.cancel() ?? false;
+    },
+  };
+}
