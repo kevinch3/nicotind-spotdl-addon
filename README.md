@@ -126,6 +126,23 @@ anything still `queued` when the run ends becomes `unavailable`. Without this th
 grew under the user — `0 of 1` → `2 of 14` → `7 of 32` — which reads as the download *changing its
 mind* about how big it is (NicotinD #595).
 
+## Measuring the real success rate
+
+Every failure-class breakdown (`classifyTrackFailure`) is explicitly *not* the signal to trust
+for "did this deployment actually help" — the largest bucket is ambiguous by construction under
+throttling. The one honest number is the overall success rate, per job, using each job's own
+announced total as the denominator (a flat line-count across a log window double-counts: a
+retried-then-recovered track still left a failure line behind). `scripts/measure-success.ts`
+(issue #651 item E) codifies the methodology this session ran by hand against kpc:
+
+```bash
+ssh <host> "docker logs --since 2026-08-24T00:00:00 nicotind-spotdl-addon-1" \
+  | bun run measure
+```
+
+Prints each job's `<downloaded> of <expected>` and rate, then one aggregate line — the same shape
+as the before/after comparison in issue #601/#651.
+
 ## Develop
 
 ```bash
@@ -133,10 +150,6 @@ bun install
 bun run typecheck   # tsc --build
 bun run test        # bun:test — resolve engine (injected spawner) + protocol server
 ```
-
-> The addon depends on `@nicotind/addon-sdk`. The `url` job intent it uses shipped in core but is
-> pending in the published SDK; once `@nicotind/addon-sdk@^0.1.1` is out, bump the dep and drop the
-> one `as unknown as` cast in `src/job-store.ts`.
 
 ## License
 

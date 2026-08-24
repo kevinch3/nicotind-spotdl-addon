@@ -14,7 +14,8 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "typecheck": "tsc --build",
-    "test": "bun test src"
+    "test": "bun test src",
+    "measure": "bun run src/scripts/measure-success.ts"
   },
   "dependencies": {
     "@nicotind/addon-sdk": "^0.1.3",
