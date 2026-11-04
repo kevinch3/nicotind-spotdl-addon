@@ -71,6 +71,13 @@ export function fakeSpawn(
 }
 
 describe("buildArgs", () => {
+  it("separates artists with a semicolon, so a list cannot be mistaken for a name like AC/DC", () => {
+    const args = buildArgs("https://open.spotify.com/album/x", "/stage", {
+      binaryPath: "spotdl",
+    });
+    expect(args[args.indexOf("--id3-separator") + 1]).toBe(";");
+  });
+
   it("downloads with skip-overwrite, bitrate-disable, and a parseable log", () => {
     const args = buildArgs("https://open.spotify.com/album/x", "/stage", {
       binaryPath: "spotdl",

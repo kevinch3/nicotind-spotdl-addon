@@ -117,6 +117,9 @@ export function buildArgs(
     "skip",
     "--bitrate",
     "disable",
+    // spotDL's default "/" reaches the library as plain text, identical to AC/DC.
+    "--id3-separator",
+    ";",
     "--simple-tui",
     "--log-level",
     "INFO",
